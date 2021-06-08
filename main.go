@@ -12,12 +12,12 @@ func main() {
 	dsn := flag.String("dsn", "", "data source name")
 	flag.Parse()
 	if len(flag.Args()) < 1 {
-		log.Fatal("Usage:\n  hello MOUNTPOINT")
+		log.Fatal("mountpoint is required")
 	}
 	opts := &fs.Options{}
-	opts.Debug = *debug
+
 	p := flag.Arg(0)
-	root := NewMySQLRoot(*dsn, "/", nil, true)
+	root := NewMySQLRoot(*dsn, nil, *debug)
 	server, err := fs.Mount(p, root, opts)
 	if err != nil {
 		log.Fatalf("Mount fail: %v\n", err)

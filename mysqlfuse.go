@@ -13,6 +13,11 @@ import (
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
+const (
+	fileMode = 0644 | uint32(syscall.S_IFREG)
+	dirMode  = 0755 | uint32(syscall.S_IFDIR)
+)
+
 type FileIndex struct {
 	path string
 	name string
@@ -23,21 +28,24 @@ var tableMap sync.Map // map[string]*sync.Map, value sync.Map is map[string]*Fil
 type MySQLRoot struct {
 	fs.Inode
 	dsn   string
-	path  string
 	db    *sql.DB
 	debug bool
 }
 
-func NewMySQLRoot(dsn string, path string, db *sql.DB, debug bool) *MySQLRoot {
+func NewMySQLRoot(dsn string, db *sql.DB, debug bool) *MySQLRoot {
 	return &MySQLRoot{
 		dsn:   dsn,
-		path:  path,
 		db:    db,
 		debug: debug,
 	}
 }
 
-var _ = (fs.NodeOnAdder)((*MySQLRoot)(nil))
+var (
+	_ = (fs.NodeOnAdder)((*MySQLRoot)(nil))
+	_ = (fs.NodeLookuper)((*MySQLRoot)(nil))
+	_ = (fs.NodeReaddirer)((*MySQLRoot)(nil))
+	_ = (fs.NodeOpendirer)((*MySQLRoot)(nil))
+)
 
 func (r *MySQLRoot) OnAdd(ctx context.Context) {
 	path := r.Path(nil)
@@ -67,9 +75,15 @@ func (r *MySQLRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		fmt.Printf("Readdir: [%s]\n", path)
 	}
 
+	var (
+		mode     uint32
+		elements []string
+	)
 	if path == "" {
+		mode = dirMode
 		// root dir, fetch tables
-		tables, err := r.getTables(ctx)
+		var err error
+		elements, err = r.getTables(ctx)
 		if err != nil {
 			return nil, syscall.ENOENT
 		}
@@ -79,84 +93,76 @@ func (r *MySQLRoot) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 			tableMap.Delete(key)
 			return true
 		})
-
-		list := []fuse.DirEntry{}
-		for i, table := range tables {
-			d := fuse.DirEntry{
-				Name: table,
-				Ino:  uint64(i),
-				Mode: 0755 | uint32(syscall.S_IFDIR),
-			}
-			list = append(list, d)
-			tableMap.Store(table, &sync.Map{})
+		for _, ele := range elements {
+			tableMap.Store(ele, &sync.Map{})
 		}
-
-		return fs.NewListDirStream(list), fs.OK
 	} else {
+		mode = fileMode
 		// table dir, fetch records
 		ids, err := r.getRecordIDs(ctx, path)
 		if err != nil {
 			return nil, syscall.ENOENT
 		}
-
-		list := []fuse.DirEntry{}
+		for _, id := range ids {
+			elements = append(elements, fmt.Sprintf("%d.sql", id))
+		}
 		value, _ := tableMap.Load(path)
+		// if not found, panic directly
 		m := value.(*sync.Map)
-		m.Range(func(kk, vv interface{}) bool {
-			m.Delete(kk)
+		m.Range(func(k, v interface{}) bool {
+			m.Delete(k)
 			return true
 		})
-
-		for _, id := range ids {
-			d := fuse.DirEntry{
-				Name: fmt.Sprintf("%d.sql", id),
-				Ino:  uint64(100 + id),
-				Mode: 0644 | uint32(syscall.S_IFREG),
-			}
-			list = append(list, d)
-			m.Store(id, &FileIndex{path: path, name: d.Name})
+		for _, ele := range elements {
+			p := filepath.Join(path, ele)
+			m.Store(p, &FileIndex{path: p, name: ele})
 		}
-		return fs.NewListDirStream(list), fs.OK
 	}
+
+	list := []fuse.DirEntry{}
+	for _, ele := range elements {
+		d := fuse.DirEntry{
+			Name: ele,
+			Mode: mode,
+		}
+		list = append(list, d)
+	}
+
+	return fs.NewListDirStream(list), fs.OK
 }
 
 func (r *MySQLRoot) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*fs.Inode, syscall.Errno) {
-	childPath := filepath.Join(r.Path(nil), name)
+	currentDir := r.Path(nil)
+	childPath := filepath.Join(currentDir, name)
 	if r.debug {
 		fmt.Printf("Lookup: [%s]\n", childPath)
 	}
 
-	var childNode *fs.Inode
-	tableMap.Range(func(key, value interface{}) bool {
-		if childPath == key {
-			// table dir
-			sa := fs.StableAttr{
-				Mode: 0755 | uint32(syscall.S_IFDIR),
-			}
-			childNode = r.NewInode(ctx, NewMySQLRoot(r.dsn, r.path, r.db, r.debug), sa)
-			return false
+	var mode uint32
+	if currentDir == "" {
+		mode = dirMode
+		// root dir
+		if _, ok := tableMap.Load(name); !ok {
+			return nil, syscall.ENOENT
 		}
-
-		m := value.(*sync.Map)
-		m.Range(func(kk, vv interface{}) bool {
-			fi := vv.(*FileIndex)
-			if childPath == fi.path {
-				sa := fs.StableAttr{
-					Mode: 0644 | uint32(syscall.S_IFREG),
-				}
-				childNode = r.NewInode(ctx, NewMySQLRoot(r.dsn, r.path, r.db, r.debug), sa)
-				return false
-			}
-			return true
-		})
-
-		return true
-	})
-
-	if childNode != nil {
-		return childNode, fs.OK
+	} else {
+		mode = fileMode
+		v, ok := tableMap.Load(currentDir)
+		if !ok {
+			return nil, syscall.ENOENT
+		}
+		m := v.(*sync.Map)
+		if _, ok := m.Load(childPath); !ok {
+			return nil, syscall.ENOENT
+		}
 	}
-	return nil, syscall.ENOENT
+
+	sa := fs.StableAttr{
+		Mode: mode,
+	}
+
+	childNode := r.NewInode(ctx, NewMySQLRoot(r.dsn, r.db, r.debug), sa)
+	return childNode, fs.OK
 }
 
 func (r *MySQLRoot) getTables(ctx context.Context) ([]string, error) {
